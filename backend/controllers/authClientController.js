@@ -1,0 +1,248 @@
+const prisma = require('../config/prisma');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+
+const JWT_SECRET = process.env.JWT_SECRET || 'dafatih_secret_key_2026';
+
+// Konfigurasi Keamanan HttpOnly Cookie untuk Klien (Berlaku 7 Hari)
+const COOKIE_OPTIONS = {
+  httpOnly: true, // Mencegah pencurian token via skrip JavaScript frontend
+  secure: process.env.NODE_ENV === 'production', // Menggunakan HTTPS saat di lingkungan produksi
+  sameSite: 'lax', // Melindungi dari serangan CSRF
+  maxAge: 7 * 24 * 60 * 60 * 1000 // Masa berlaku cookie (7 hari)
+};
+
+// Helper format data profil klien agar seragam
+const formatUser = (user) => {
+  if (!user) return null;
+  return {
+    id: user.id,
+    name: user.name || '',
+    email: user.email || '',
+    phone: user.phone || '',
+    role: user.role || 'user',
+    created_at: user.created_at || user.createdAt || null
+  };
+};
+
+/**
+ * 1. REGISTRASI KLIEN BARU
+ * Route: POST /api/client/register
+ */
+exports.registerClient = async (req, res) => {
+  try {
+    const { name, phone, email, password } = req.body;
+
+    if (!name || !phone || !email || !password) {
+      return res.status(400).json({
+        success: false,
+        message: 'Harap isi semua kolom wajib (Nama, WA/HP, Email, dan Password).'
+      });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+
+    const existingUser = await prisma.user.findUnique({
+      where: { email: normalizedEmail }
+    });
+
+    if (existingUser) {
+      return res.status(400).json({
+        success: false,
+        message: 'Email sudah terdaftar. Silakan gunakan email lain atau login.'
+      });
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
+    const newUser = await prisma.user.create({
+      data: {
+        name: name.trim(),
+        phone: phone.trim(),
+        email: normalizedEmail,
+        password: hashedPassword,
+        role: 'user'
+      }
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: 'Registrasi berhasil! Silakan login dengan akun Anda.',
+      data: formatUser(newUser)
+    });
+  } catch (error) {
+    console.error('Error registerClient:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Terjadi kesalahan pada server saat registrasi: ' + error.message
+    });
+  }
+};
+
+/**
+ * 2. LOGIN KLIEN (Menggunakan HttpOnly Cookie & Memblokir Admin)
+ * Route: POST /api/client/login
+ */
+exports.loginClient = async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({
+        success: false,
+        message: 'Email dan kata sandi wajib diisi.'
+      });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { email: email.toLowerCase().trim() }
+    });
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: 'Email atau kata sandi tidak cocok.'
+      });
+    }
+
+    const currentRole = String(user.role || '').toLowerCase().trim();
+    if (currentRole === 'admin') {
+      return res.status(403).json({
+        success: false,
+        message: 'Akses ditolak! Akun Administrator tidak dapat login melalui halaman Klien.'
+      });
+    }
+
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
+      return res.status(401).json({
+        success: false,
+        message: 'Email atau kata sandi tidak cocok.'
+      });
+    }
+
+    const token = jwt.sign(
+      { id: user.id, name: user.name, email: user.email, role: user.role || 'user' },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    // Kirim token via HttpOnly Cookie
+    res.cookie('token', token, COOKIE_OPTIONS);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Login berhasil!',
+      user: formatUser(user)
+    });
+  } catch (error) {
+    console.error('Error loginClient:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Terjadi kesalahan pada server saat login: ' + error.message
+    });
+  }
+};
+
+/**
+ * 3. LOGOUT KLIEN
+ * Route: POST /api/client/logout
+ */
+exports.logoutClient = async (req, res) => {
+  try {
+    res.clearCookie('token', {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax'
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Logout berhasil, sesi telah dihapus!'
+    });
+  } catch (error) {
+    console.error('Error logoutClient:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Gagal melakukan logout: ' + error.message
+    });
+  }
+};
+
+/**
+ * 4. GET PROFIL KLIEN
+ * Route: GET /api/client/profile
+ */
+exports.getClientProfile = async (req, res) => {
+  try {
+    const rawUserId = req.user?.id || req.query.id;
+    const userId = Number(rawUserId);
+
+    if (!userId || isNaN(userId)) {
+      return res.status(400).json({
+        success: false,
+        message: 'ID Pengguna tidak valid.'
+      });
+    }
+
+    const user = await prisma.user.findUnique({ where: { id: userId } });
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'Pengguna tidak ditemukan.'
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: formatUser(user)
+    });
+  } catch (error) {
+    console.error('Error getClientProfile:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Gagal mengambil data profil: ' + error.message
+    });
+  }
+};
+
+/**
+ * 5. UPDATE PROFIL KLIEN
+ * Route: PUT /api/client/profile
+ */
+exports.updateClientProfile = async (req, res) => {
+  try {
+    const rawUserId = req.user?.id || req.body.id;
+    const userId = Number(rawUserId);
+    const { name, phone } = req.body;
+
+    if (!userId || isNaN(userId)) {
+      return res.status(400).json({
+        success: false,
+        message: 'ID Pengguna tidak valid.'
+      });
+    }
+
+    const updatedUser = await prisma.user.update({
+      where: { id: userId },
+      data: {
+        name: name ? name.trim() : undefined,
+        phone: phone ? phone.trim() : undefined
+      }
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Profil berhasil diperbarui.',
+      data: formatUser(updatedUser)
+    });
+  } catch (error) {
+    console.error('Error updateClientProfile:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Gagal memperbarui profil: ' + error.message
+    });
+  }
+};
